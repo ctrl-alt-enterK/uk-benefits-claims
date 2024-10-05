@@ -7,12 +7,13 @@ from openai import OpenAI
 from elasticsearch import Elasticsearch
 from sentence_transformers import SentenceTransformer
 
+from dotenv import load_dotenv
 
+load_dotenv()
 
 ELASTIC_URL = os.getenv("ELASTIC_URL", "http://elasticsearch:9200")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434/v1/")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your-api-key-here")
-
 
 es_client = Elasticsearch(ELASTIC_URL)
 ollama_client = OpenAI(base_url=OLLAMA_URL, api_key="ollama")
@@ -44,21 +45,114 @@ def elastic_search_text(query, section, index_name="benefit-claims"):
 
 def elastic_search_knn(field, vector, section, index_name="benefit-claims"):
     knn = {
-        "field": field,
-        "query_vector": vector,
-        "k": 5,
-        "num_candidates": 10000,
-        "filter": {"term": {"section": section}},
+        "knn": {
+            "field": field,
+            "query_vector": vector,
+            "k": 5,
+            "num_candidates": 10000,
+            "filter": {"term": {"section": section}},
+        }
     }
 
     search_query = {
-        "knn": knn,
+        "query": {
+            "bool": {
+                "should": [
+                    knn,
+                    {
+                        "multi_match": {
+                            "query": "",  # Placeholder, will be overridden
+                            "fields": ["question", "answer", "category"],
+                            "type": "best_fields",
+                        }
+                    }
+                ]
+            }
+        },
+        "size": 5,
         "_source": ["answer", "section", "question", "category", "id"],
+    }
+
+    # Since keyword query is already handled in elastic_search_text, we will use only knn here
+    es_results = es_client.search(index=index_name, body={
+        "size": 5,
+        "query": {
+            "bool": {
+                "must": {
+                    "knn": {
+                        "field": field,
+                        "query_vector": vector,
+                        "k": 5,
+                        "num_candidates": 10000,
+                        "filter": {"term": {"section": section}},
+                    }
+                }
+            }
+        },
+        "_source": ["answer", "section", "question", "category", "id"],
+    })
+
+    return [hit["_source"] for hit in es_results["hits"]["hits"]]
+
+
+def elastic_search_hybrid(query, vector, section, index_name="benefit-claims"):
+    # Combine knn and keyword search
+    search_query = {
+        "size": 5,
+        "query": {
+            "bool": {
+                "should": [
+                    {
+                        "knn": {
+                            "field": "question_answer_vector",
+                            "query_vector": vector,
+                            "k": 5,
+                            "num_candidates": 10000,
+                            "boost": 0.5,
+                            "filter": {
+                                "term": {
+                                    "section": section
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "bool": {
+                            "must": {
+                                "multi_match": {
+                                    "query": query,
+                                    "fields": ["question^3", "answer", "category"],
+                                    "type": "best_fields",
+                                    "boost": 0.5,
+                                }
+                            },
+                            "filter": {
+                                "term": {
+                                    "section": section
+                                }
+                            }
+                        }
+                    }
+                ]
+            }
+        },
+        "_source": ["answer", "section", "question", "category", "id"]
     }
 
     es_results = es_client.search(index=index_name, body=search_query)
 
-    return [hit["_source"] for hit in es_results["hits"]["hits"]]
+    result_docs = [hit["_source"] for hit in es_results["hits"]["hits"]]
+
+    return result_docs
+
+
+def question_text_hybrid(q):
+    question = q['question']
+    section = q['section']  # Assuming 'section' is equivalent to 'course'
+
+    v_q = model.encode(question)
+
+    return elastic_search_hybrid(question, v_q, section)
 
 
 def build_prompt(query, search_results):
@@ -80,7 +174,6 @@ CONTEXT:
         ]
     )
     return prompt_template.format(question=query, context=context).strip()
-    
 
 
 def llm(prompt, model_choice):
@@ -118,24 +211,24 @@ def llm(prompt, model_choice):
 
 def evaluate_relevance(question, answer):
     prompt_template = """
-    You are an expert evaluator for a Retrieval-Augmented Generation (RAG) system.
-    Your task is to analyze the relevance of the generated answer to the given question.
-    Based on the relevance of the generated answer, you will classify it
-    as "NON_RELEVANT", "PARTLY_RELEVANT", or "RELEVANT".
+You are an expert evaluator for a Retrieval-Augmented Generation (RAG) system.
+Your task is to analyze the relevance of the generated answer to the given question.
+Based on the relevance of the generated answer, you will classify it
+as "NON_RELEVANT", "PARTLY_RELEVANT", or "RELEVANT".
 
-    Here is the data for evaluation:
+Here is the data for evaluation:
 
-    Question: {question}
-    Generated Answer: {answer}
+Question: {question}
+Generated Answer: {answer}
 
-    Please analyze the content and context of the generated answer in relation to the question
-    and provide your evaluation in parsable JSON without using code blocks:
+Please analyze the content and context of the generated answer in relation to the question
+and provide your evaluation in parsable JSON without using code blocks:
 
-    {{
-      "Relevance": "NON_RELEVANT" | "PARTLY_RELEVANT" | "RELEVANT",
-      "Explanation": "[Provide a brief explanation for your evaluation]"
-    }}
-    """.strip()
+{
+  "Relevance": "NON_RELEVANT" | "PARTLY_RELEVANT" | "RELEVANT",
+  "Explanation": "[Provide a brief explanation for your evaluation]"
+}
+""".strip()
 
     prompt = prompt_template.format(question=question, answer=answer)
     evaluation, tokens, _ = llm(prompt, 'openai/gpt-4o-mini')
@@ -158,10 +251,13 @@ def calculate_openai_cost(model_choice, tokens):
     return openai_cost
 
 
-def get_answer(query, section, model_choice, search_type):
+def get_answer(query, section, model_choice, search_type='Hybrid'):
     if search_type == 'Vector':
         vector = model.encode(query)
         search_results = elastic_search_knn('question_answer_vector', vector, section)
+    elif search_type == 'Hybrid':
+        q = {'question': query, 'section': section}
+        search_results = question_text_hybrid(q)
     else:
         search_results = elastic_search_text(query, section)
 

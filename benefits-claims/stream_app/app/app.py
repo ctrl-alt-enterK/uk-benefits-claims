@@ -22,13 +22,15 @@ def main():
     model_choice = st.selectbox("Select a model:", ["ollama/phi3", "openai/gpt-3.5-turbo", "openai/gpt-4o", "openai/gpt-4o-mini"])
 
     # Search type selection
-    search_type = st.radio("Select search type:", ["Text", "Vector"])
+    st.write("Rendering search type selection...")
+    search_type = st.radio("Select search type:", ["Text", "Vector", "Hybrid"])
+    st.write(f"Selected search type: {search_type}")
 
     # User input
     user_input = st.text_input("Enter your question:")
 
     if st.button("Ask"):
-        if user_input:  # Only process if user has input something
+        if user_input:  
             with st.spinner("Processing..."):
                 start_time = time.time()
                 answer_data = get_answer(user_input, section, model_choice, search_type)
